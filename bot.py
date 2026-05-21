@@ -1,6 +1,7 @@
 """
-Telegram Video Yuklab Olish Boti — INSTAGRAM YAXSHILANGAN VERSIYA
-TikTok, YouTube, Instagram, Twitter va boshqa saytlardan video yuklab oladi.
+Telegram Video Yuklab Olish Boti â€” APIFY INSTAGRAM bilan
+TikTok, YouTube â€” yt-dlp orqali
+Instagram â€” Apify Instagram Scraper API orqali
 """
 
 import os
@@ -8,6 +9,7 @@ import logging
 import asyncio
 from pathlib import Path
 import yt_dlp
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "")
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")  # Apify token
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -49,51 +52,125 @@ async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     welcome_text = (
-        f"Assalomu alaykum, {user.first_name}! 👋\n\n"
-        "Men video yuklab olish botiman 🎬\n\n"
-        "📱 Qo'llab-quvvatlanadi:\n"
-        "• TikTok ✅\n"
-        "• YouTube Shorts ✅\n"
-        "• Instagram Reels (public) ✅\n"
-        "• Twitter / X ✅\n"
-        "• Facebook ✅\n\n"
-        "✨ Faqat video havolasini (link) yuboring!\n\n"
-        "⚠️ Eslatma: 50MB dan katta videolar yuborilmaydi"
+        f"Assalomu alaykum, {user.first_name}! ðŸ‘‹\n\n"
+        "Men video yuklab olish botiman ðŸŽ¬\n\n"
+        "ðŸ“± Qo'llab-quvvatlanadi:\n"
+        "â€¢ TikTok âœ…\n"
+        "â€¢ YouTube Shorts âœ…\n"
+        "â€¢ Instagram Reels âœ…\n"
+        "â€¢ Twitter / X âœ…\n"
+        "â€¢ Facebook âœ…\n\n"
+        "âœ¨ Faqat video havolasini (link) yuboring!"
     )
     await update.message.reply_text(welcome_text)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "📖 Qanday foydalanish:\n\n"
-        "1️⃣ Istalgan video havolasini nusxa oling\n"
-        "2️⃣ Menga yuboring\n"
-        "3️⃣ Bir necha soniyada videoni olasiz!"
+        "ðŸ“– Qanday foydalanish:\n\n"
+        "1ï¸âƒ£ Istalgan video havolasini nusxa oling\n"
+        "2ï¸âƒ£ Menga yuboring\n"
+        "3ï¸âƒ£ Bir necha soniyada videoni olasiz!"
     )
     await update.message.reply_text(help_text)
 
 
-def normalize_instagram_url(url: str) -> str:
-    """Instagram URL'ini standart formatga keltiradi"""
-    # /reels/ ni /reel/ ga o'zgartirish (yt-dlp ba'zan /reel/ ni yaxshiroq tushunadi)
-    url = url.replace("/reels/", "/reel/")
-    # Tracking parametrlarni olib tashlash
-    if "?" in url:
-        url = url.split("?")[0]
-    return url
+# ========== INSTAGRAM uchun APIFY ==========
+async def download_instagram_via_apify(url: str) -> tuple:
+    """Apify Instagram Scraper orqali video URL'ini olish"""
+    if not APIFY_TOKEN:
+        return None, "Apify token sozlanmagan"
+    
+    try:
+        # Apify Instagram Scraper actor'ni ishga tushirish
+        actor_url = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token={APIFY_TOKEN}"
+        
+        payload = {
+            "directUrls": [url],
+            "resultsType": "posts",
+            "resultsLimit": 1,
+            "addParentData": False,
+        }
+        
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(actor_url, json=payload)
+            
+            if response.status_code != 200 and response.status_code != 201:
+                logger.error(f"Apify javob xato: {response.status_code} - {response.text}")
+                return None, f"Apify xato: {response.status_code}"
+            
+            data = response.json()
+            
+            if not data or len(data) == 0:
+                return None, "Video ma'lumoti topilmadi"
+            
+            post = data[0]
+            
+            # Video URL'ini topish
+            video_url = post.get("videoUrl") or post.get("videoUrlBackup")
+            
+            if not video_url:
+                # Carousel (album) tekshirish
+                if "childPosts" in post and post["childPosts"]:
+                    for child in post["childPosts"]:
+                        if child.get("videoUrl"):
+                            video_url = child["videoUrl"]
+                            break
+            
+            if not video_url:
+                return None, "Video URL topilmadi (post rasm bo'lishi mumkin)"
+            
+            return {
+                "video_url": video_url,
+                "title": post.get("caption", "Instagram Video")[:100] if post.get("caption") else "Instagram Video",
+                "owner": post.get("ownerUsername", ""),
+            }, None
+            
+    except httpx.TimeoutException:
+        return None, "Apify javob bermadi (timeout)"
+    except Exception as e:
+        logger.error(f"Apify Instagram xato: {e}", exc_info=True)
+        return None, str(e)
 
 
+async def download_file_from_url(video_url: str, output_path: Path) -> bool:
+    """URL'dan video faylni yuklab olish"""
+    try:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            async with client.stream("GET", video_url) as response:
+                if response.status_code != 200:
+                    return False
+                
+                total_size = 0
+                with open(output_path, "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        f.write(chunk)
+                        total_size += len(chunk)
+                        if total_size > MAX_FILE_SIZE:
+                            logger.warning("Fayl 50MB dan oshdi")
+                            return False
+                
+                return True
+    except Exception as e:
+        logger.error(f"Fayl yuklashda xato: {e}")
+        return False
+
+
+# ========== TikTok va YouTube uchun yt-dlp ==========
 def get_ydl_opts(output_path: str, url: str) -> dict:
-    """URL turiga qarab moslangan sozlamalar"""
     opts = {
         "outtmpl": output_path,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "max_filesize": MAX_FILE_SIZE,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+        },
     }
 
     if "youtube.com" in url or "youtu.be" in url:
@@ -103,164 +180,146 @@ def get_ydl_opts(output_path: str, url: str) -> dict:
                 "player_client": ["android", "web"],
             }
         }
-        opts["http_headers"] = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-        }
-    elif "instagram.com" in url:
-        # Instagram uchun MAXSUS sozlamalar
-        opts["format"] = "best[filesize<50M]/best"
-        opts["http_headers"] = {
-            # Instagram mobil ilovasidek ko'rinish (ko'proq ishlaydi)
-            "User-Agent": "Instagram 219.0.0.12.117 Android",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "X-IG-App-ID": "936619743392459",  # Instagram web app ID
-        }
-        # Instagram uchun maxsus extractor args
-        opts["extractor_args"] = {
-            "instagram": {
-                "include_stories": ["0"],
-            }
-        }
     elif "tiktok.com" in url:
         opts["format"] = "best[filesize<50M]/best"
-        opts["http_headers"] = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-        }
     else:
         opts["format"] = "best[filesize<50M]/best[height<=720]/best"
-        opts["http_headers"] = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-        }
 
     return opts
 
 
-def _download(url: str, ydl_opts: dict):
+def _download_with_ytdlp(url: str, ydl_opts: dict):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             return info, None
     except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        logger.error(f"yt-dlp DownloadError: {error_msg}")
-        return None, error_msg
+        return None, str(e)
     except Exception as e:
-        logger.error(f"yt-dlp xatosi: {e}", exc_info=True)
+        logger.error(f"yt-dlp xatosi: {e}")
         return None, str(e)
 
 
+# ========== ASOSIY VIDEO YUKLASH ==========
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     user_id = update.effective_user.id
 
     if not (url.startswith("http://") or url.startswith("https://")):
         await update.message.reply_text(
-            "❌ Iltimos, to'g'ri havola yuboring.\n"
+            "âŒ Iltimos, to'g'ri havola yuboring.\n"
             "Masalan: https://www.tiktok.com/..."
         )
         return
 
-    # Instagram URL'ini normalizatsiya qilish
-    if "instagram.com" in url:
-        url = normalize_instagram_url(url)
-        logger.info(f"Instagram URL normalizatsiya qilindi: {url}")
-
     is_subscribed = await check_subscription(user_id, context)
     if not is_subscribed:
         keyboard = [
-            [InlineKeyboardButton("📢 Kanalga obuna bo'lish", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")],
-            [InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")],
+            [InlineKeyboardButton("ðŸ“¢ Kanalga obuna bo'lish", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")],
+            [InlineKeyboardButton("âœ… Tekshirish", callback_data="check_sub")],
         ]
         await update.message.reply_text(
-            "⚠️ Botdan foydalanish uchun avval kanalimizga obuna bo'ling!",
+            "âš ï¸ Botdan foydalanish uchun avval kanalimizga obuna bo'ling!",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
-    status_message = await update.message.reply_text("⏳ Video yuklanmoqda, kuting...")
-
+    status_message = await update.message.reply_text("â³ Video yuklanmoqda, kuting...")
     output_template = str(DOWNLOAD_DIR / f"{user_id}_{update.message.message_id}.%(ext)s")
-    ydl_opts = get_ydl_opts(output_template, url)
-
+    
+    downloaded_file = None
+    info_data = None
+    
     try:
-        loop = asyncio.get_event_loop()
-        info, error = await loop.run_in_executor(None, lambda: _download(url, ydl_opts))
-
-        # Agar Instagram ishlamasa, qayta urinish — boshqacha sozlamalar bilan
-        if not info and "instagram.com" in url:
-            logger.info("Instagram birinchi urinish muvaffaqiyatsiz, qayta urinish...")
-            # Boshqacha User-Agent bilan urinish
-            ydl_opts["http_headers"]["User-Agent"] = (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.0 Mobile/15E148 Safari/604.1"
-            )
-            info, error = await loop.run_in_executor(None, lambda: _download(url, ydl_opts))
-
-        if not info:
-            error_text = "❌ Videoni yuklab bo'lmadi.\n\n"
-            if error:
-                err_lower = error.lower()
-                if "instagram" in url.lower() and ("login" in err_lower or "rate" in err_lower or "empty" in err_lower):
-                    error_text += (
-                        "🔒 Instagram bu videoni berishni rad etdi.\n\n"
-                        "Sabablari:\n"
-                        "• Akkaunt yopiq bo'lishi mumkin\n"
-                        "• Instagram vaqtincha cheklab qo'ydi\n"
-                        "• Story yoki Highlight (qo'llab-quvvatlanmaydi)\n\n"
-                        "💡 Qayta urinib ko'ring 5-10 daqiqadan keyin."
-                    )
-                elif "private" in err_lower or "login required" in err_lower:
-                    error_text += "🔒 Bu video yopiq (private) akkauntdan."
-                elif "not available" in err_lower or "unavailable" in err_lower or "removed" in err_lower:
-                    error_text += "🚫 Video mavjud emas yoki o'chirilgan."
-                elif "filesize" in err_lower or "too large" in err_lower:
-                    error_text += "📦 Video 50MB dan katta."
-                elif "sign in" in err_lower or "confirm you" in err_lower:
-                    error_text += "🤖 Sayt vaqtincha cheklab qo'ydi.\nBoshqa video sinab ko'ring."
-                else:
-                    error_text += f"Boshqa video havolasini sinab ko'ring."
-            else:
-                error_text += "Boshqa video havolasini sinab ko'ring."
+        # ===== INSTAGRAM uchun Apify =====
+        if "instagram.com" in url:
+            await status_message.edit_text("â³ Instagram'dan yuklanmoqda...")
             
-            await status_message.edit_text(error_text)
-            return
+            instagram_data, error = await download_instagram_via_apify(url)
+            
+            if not instagram_data:
+                error_text = "âŒ Instagram videoni yuklab bo'lmadi.\n\n"
+                if error:
+                    if "rasm" in error.lower() or "post rasm" in error.lower():
+                        error_text += "ðŸ“· Bu video emas, balki rasm bo'lishi mumkin."
+                    elif "timeout" in error.lower():
+                        error_text += "â± Vaqt tugadi, qaytadan urinib ko'ring."
+                    else:
+                        error_text += f"Sabab: {error}"
+                await status_message.edit_text(error_text)
+                return
+            
+            # Video URL'ini olib, faylni yuklash
+            output_path = DOWNLOAD_DIR / f"{user_id}_{update.message.message_id}.mp4"
+            success = await download_file_from_url(instagram_data["video_url"], output_path)
+            
+            if not success or not output_path.exists():
+                await status_message.edit_text(
+                    "âŒ Video faylni yuklab bo'lmadi.\n"
+                    "Hajmi katta bo'lishi yoki havola eskirgan bo'lishi mumkin."
+                )
+                if output_path.exists():
+                    output_path.unlink()
+                return
+            
+            downloaded_file = output_path
+            info_data = {
+                "title": instagram_data["title"],
+                "owner": instagram_data["owner"],
+            }
+        
+        # ===== TikTok, YouTube va boshqalar uchun yt-dlp =====
+        else:
+            ydl_opts = get_ydl_opts(output_template, url)
+            loop = asyncio.get_event_loop()
+            info, error = await loop.run_in_executor(None, lambda: _download_with_ytdlp(url, ydl_opts))
+            
+            if not info:
+                error_text = "âŒ Videoni yuklab bo'lmadi.\n\n"
+                if error:
+                    err_lower = error.lower()
+                    if "private" in err_lower or "login" in err_lower:
+                        error_text += "ðŸ”’ Yopiq (private) akkauntdan."
+                    elif "unavailable" in err_lower or "removed" in err_lower:
+                        error_text += "ðŸš« Video mavjud emas yoki o'chirilgan."
+                    elif "sign in" in err_lower:
+                        error_text += "ðŸ¤– Sayt vaqtincha cheklab qo'ydi. Keyinroq urinib ko'ring."
+                    else:
+                        error_text += "Boshqa video havolasini sinab ko'ring."
+                await status_message.edit_text(error_text)
+                return
+            
+            # Fayl yo'lini topish
+            for file in DOWNLOAD_DIR.glob(f"{user_id}_{update.message.message_id}.*"):
+                downloaded_file = file
+                break
+            
+            if not downloaded_file or not downloaded_file.exists():
+                await status_message.edit_text("âŒ Fayl topilmadi. Video katta bo'lishi mumkin.")
+                return
+            
+            info_data = {
+                "title": info.get("title", "Video"),
+                "owner": info.get("uploader", ""),
+            }
 
-        downloaded_file = None
-        for file in DOWNLOAD_DIR.glob(f"{user_id}_{update.message.message_id}.*"):
-            downloaded_file = file
-            break
-
-        if not downloaded_file or not downloaded_file.exists():
-            await status_message.edit_text(
-                "❌ Fayl topilmadi.\n"
-                "Video juda katta bo'lishi mumkin."
-            )
-            return
-
+        # ===== Faylni yuborish (umumiy qism) =====
         file_size = downloaded_file.stat().st_size
         size_mb = file_size / (1024 * 1024)
         
         if file_size > MAX_FILE_SIZE:
             await status_message.edit_text(
-                f"❌ Video juda katta ({size_mb:.1f} MB).\n"
-                "Telegram 50MB dan katta fayllarni yubora olmaydi."
+                f"âŒ Video juda katta ({size_mb:.1f} MB).\n"
+                "Telegram 50MB dan kattani yubora olmaydi."
             )
             downloaded_file.unlink()
             return
 
-        title = info.get("title", "Video")[:100]
+        title = info_data["title"][:100] if info_data["title"] else "Video"
         bot_username = context.bot.username
-        caption = f"🎬 {title}\n\n🤖 @{bot_username}"
+        caption = f"ðŸŽ¬ {title}\n\nðŸ¤– @{bot_username}"
 
-        await status_message.edit_text(f"📤 Yuborilmoqda... ({size_mb:.1f} MB)")
+        await status_message.edit_text(f"ðŸ“¤ Yuborilmoqda... ({size_mb:.1f} MB)")
         
         try:
             with open(downloaded_file, "rb") as video_file:
@@ -276,14 +335,11 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Yuborishda xato: {send_error}")
             try:
                 with open(downloaded_file, "rb") as doc_file:
-                    await update.message.reply_document(
-                        document=doc_file,
-                        caption=caption,
-                    )
+                    await update.message.reply_document(document=doc_file, caption=caption)
                 await status_message.delete()
             except Exception as e2:
                 logger.error(f"Document sifatida ham yuborib bo'lmadi: {e2}")
-                await status_message.edit_text("❌ Videoni yuborib bo'lmadi.")
+                await status_message.edit_text("âŒ Videoni yuborib bo'lmadi.")
 
         try:
             downloaded_file.unlink()
@@ -291,10 +347,9 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     except Exception as e:
-        logger.error(f"Yuklab olishda umumiy xato: {e}", exc_info=True)
-        await status_message.edit_text(
-            "❌ Xatolik yuz berdi. Keyinroq urinib ko'ring."
-        )
+        logger.error(f"Umumiy xato: {e}", exc_info=True)
+        await status_message.edit_text("âŒ Xatolik yuz berdi. Qaytadan urinib ko'ring.")
+        # Tozalash
         for file in DOWNLOAD_DIR.glob(f"{user_id}_{update.message.message_id}.*"):
             try:
                 file.unlink()
@@ -308,15 +363,18 @@ async def check_subscription_callback(update: Update, context: ContextTypes.DEFA
     user_id = query.from_user.id
     is_subscribed = await check_subscription(user_id, context)
     if is_subscribed:
-        await query.edit_message_text("✅ Rahmat! Endi video havolasini yuboring.")
+        await query.edit_message_text("âœ… Rahmat! Endi video havolasini yuboring.")
     else:
-        await query.answer("❌ Hali obuna bo'lmagansiz!", show_alert=True)
+        await query.answer("âŒ Hali obuna bo'lmagansiz!", show_alert=True)
 
 
 def main():
     if not BOT_TOKEN:
-        print("❌ XATO: BOT_TOKEN o'rnatilmagan!")
+        print("âŒ XATO: BOT_TOKEN o'rnatilmagan!")
         return
+    
+    if not APIFY_TOKEN:
+        print("âš ï¸ OGOHLANTIRISH: APIFY_TOKEN o'rnatilmagan! Instagram ishlamaydi.")
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -325,7 +383,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="check_sub"))
 
-    print("🤖 Bot ishga tushdi! (Instagram yaxshilangan versiya)")
+    print("ðŸ¤– Bot ishga tushdi! (Apify Instagram bilan)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
