@@ -1,5 +1,5 @@
 """
-Telegram Video Yuklab Olish Boti â€” YANGILANGAN VERSIYA
+Telegram Video Yuklab Olish Boti â€” YANGILANGAN 
 TikTok, YouTube, Instagram, Twitter va boshqa saytlardan video yuklab oladi.
 """
 
